@@ -26,8 +26,8 @@ from typing import Any, Dict, Optional
 
 import torch
 from lhotse import CutSet, Fbank, FbankConfig, load_manifest, load_manifest_lazy
-from lhotse.dataset import CutConcatenate  # noqa F401 for PrecomputedFeatures
-from lhotse.dataset import (
+from lhotse.dataset import (  # noqa F401 for PrecomputedFeatures
+    CutConcatenate,
     CutMix,
     DynamicBucketingSampler,
     K2SpeechRecognitionDataset,
@@ -35,8 +35,10 @@ from lhotse.dataset import (
     SimpleCutSampler,
     SpecAugment,
 )
-from lhotse.dataset.input_strategies import AudioSamples  # noqa F401 For AudioSamples
-from lhotse.dataset.input_strategies import OnTheFlyFeatures
+from lhotse.dataset.input_strategies import (  # noqa F401 For AudioSamples
+    AudioSamples,
+    OnTheFlyFeatures,
+)
 from lhotse.utils import fix_random_seed
 from torch.utils.data import DataLoader
 
@@ -51,12 +53,11 @@ class _SeedWorkers:
         fix_random_seed(self.seed + worker_id)
 
 
-class Xbmu_AmdoAsrDataModule:
+class XbmuAmdoAsrDataModule:
     """
-    DataModule for k2 ASR experiments.
+    DataModule for k2 ASR experiments on XBMU Amdo31 dataset.
     It assumes there is always one train and valid dataloader,
-    but there can be multiple test dataloaders (e.g. LibriSpeech test-clean
-    and test-other).
+    but there can be multiple test dataloaders.
 
     It contains all the common data pipeline modules used in ASR
     experiments, e.g.:
@@ -66,7 +67,7 @@ class Xbmu_AmdoAsrDataModule:
     - augmentation,
     - on-the-fly feature extraction
 
-    This class should be derived for specific corpora used in ASR tasks.
+    This class is adapted for XBMU Amdo31 corpus used in ASR tasks.
     """
 
     def __init__(self, args: argparse.Namespace):
@@ -182,7 +183,7 @@ class Xbmu_AmdoAsrDataModule:
             help="Used only when --enable-spec-aug is True. "
             "It specifies the factor for time warping in SpecAugment. "
             "Larger values mean more warping. "
-            "A value less than 1 means to disable time warp.",
+            "A value of zero means to disable time warp.",
         )
 
         group.add_argument(
@@ -218,19 +219,20 @@ class Xbmu_AmdoAsrDataModule:
             logging.info("About to get Musan cuts")
             cuts_musan = load_manifest(self.args.manifest_dir / "musan_cuts.jsonl.gz")
             transforms.append(
-                CutMix(cuts=cuts_musan, p=0.5, snr=(10, 20), preserve_id=True)
+                CutMix(cuts=cuts_musan, prob=0.5, snr=(10, 20), preserve_id=True)
             )
         else:
             logging.info("Disable MUSAN")
 
         if self.args.concatenate_cuts:
             logging.info(
-                f"Using cut concatenation with duration factor "
-                f"{self.args.duration_factor} and gap {self.args.gap}."
+                f"Using CutConcatenate with duration_factor={self.args.duration_factor} and gap={self.args.gap}."
             )
             # Cut concatenation should be the first transform in the list,
-            # so that if we e.g. mix noise in, it will fill the gaps between
-            # different utterances.
+            # so that if we e.g. mix noise in, we will mix it into the
+            # concatenated cut.
+            # This also helps with having a more even distribution of cut
+            # lengths, rather than having many very short cuts.
             transforms = [
                 CutConcatenate(
                     duration_factor=self.args.duration_factor, gap=self.args.gap
@@ -244,28 +246,22 @@ class Xbmu_AmdoAsrDataModule:
             # Set the value of num_frame_masks according to Lhotse's version.
             # In different Lhotse's versions, the default of num_frame_masks is
             # different.
-            num_frame_masks = 10
-            num_frame_masks_parameter = inspect.signature(
-                SpecAugment.__init__
-            ).parameters["num_frame_masks"]
-            if num_frame_masks_parameter.default == 1:
-                num_frame_masks = 2
-            logging.info(f"Num frame mask: {num_frame_masks}")
-            input_transforms.append(
-                SpecAugment(
-                    time_warp_factor=self.args.spec_aug_time_warp_factor,
-                    num_frame_masks=num_frame_masks,
-                    features_mask_size=27,
-                    num_feature_masks=2,
-                    frames_mask_size=100,
-                )
+            spec_aug_transform = SpecAugment(
+                time_warp_factor=self.args.spec_aug_time_warp_factor,
+                num_frame_masks=2,
+                features_mask_size=27,
+                num_feature_masks=2,
+                frames_mask_size=100,
             )
+            input_transforms.append(spec_aug_transform)
         else:
             logging.info("Disable SpecAugment")
 
         logging.info("About to create train dataset")
-        train = K2SpeechRecognitionDataset(
-            input_strategy=eval(self.args.input_strategy)(),
+        train_dataset = K2SpeechRecognitionDataset(
+            input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80)))
+            if self.args.on_the_fly_feats
+            else eval(self.args.input_strategy)(),
             cut_transforms=transforms,
             input_transforms=input_transforms,
             return_cuts=self.args.return_cuts,
@@ -277,17 +273,11 @@ class Xbmu_AmdoAsrDataModule:
             # Add on-the-fly speed perturbation; since originally it would
             # have increased epoch size by 3, we will apply prob 2/3 and use
             # 3x more epochs.
-            # Speed perturbation probably should come first before
-            # concatenation, but in principle the transforms order doesn't have
-            # to be strict (e.g. could be randomized)
+            # Speed perturbation probably should come before
+            # concatenation, but in principle the transforms order doesn't have to
+            # be strict (e.g. could be randomized)
             # transforms = [PerturbSpeed(factors=[0.9, 1.1], p=2/3)] + transforms   # noqa
-            # Drop feats to be on the safe side.
-            train = K2SpeechRecognitionDataset(
-                cut_transforms=transforms,
-                input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80))),
-                input_transforms=input_transforms,
-                return_cuts=self.args.return_cuts,
-            )
+            pass
 
         if self.args.bucketing_sampler:
             logging.info("Using DynamicBucketingSampler.")
@@ -319,7 +309,7 @@ class Xbmu_AmdoAsrDataModule:
         worker_init_fn = _SeedWorkers(seed)
 
         train_dl = DataLoader(
-            train,
+            train_dataset,
             sampler=train_sampler,
             batch_size=None,
             num_workers=self.args.num_workers,
@@ -330,24 +320,15 @@ class Xbmu_AmdoAsrDataModule:
         return train_dl
 
     def valid_dataloaders(self, cuts_valid: CutSet) -> DataLoader:
-        transforms = []
-        if self.args.concatenate_cuts:
-            transforms = [
-                CutConcatenate(
-                    duration_factor=self.args.duration_factor, gap=self.args.gap
-                )
-            ] + transforms
-
         logging.info("About to create dev dataset")
         if self.args.on_the_fly_feats:
-            validate = K2SpeechRecognitionDataset(
-                cut_transforms=transforms,
+            validate_dataset = K2SpeechRecognitionDataset(
                 input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80))),
                 return_cuts=self.args.return_cuts,
             )
         else:
-            validate = K2SpeechRecognitionDataset(
-                cut_transforms=transforms,
+            validate_dataset = K2SpeechRecognitionDataset(
+                input_strategy=eval(self.args.input_strategy)(),
                 return_cuts=self.args.return_cuts,
             )
         valid_sampler = DynamicBucketingSampler(
@@ -357,18 +338,17 @@ class Xbmu_AmdoAsrDataModule:
         )
         logging.info("About to create dev dataloader")
         valid_dl = DataLoader(
-            validate,
+            validate_dataset,
             sampler=valid_sampler,
             batch_size=None,
             num_workers=2,
-            persistent_workers=False,
         )
 
         return valid_dl
 
     def test_dataloaders(self, cuts: CutSet) -> DataLoader:
-        logging.debug("About to create test dataset")
-        test = K2SpeechRecognitionDataset(
+        logging.info("About to create test dataset")
+        test_dataset = K2SpeechRecognitionDataset(
             input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80)))
             if self.args.on_the_fly_feats
             else eval(self.args.input_strategy)(),
@@ -379,9 +359,9 @@ class Xbmu_AmdoAsrDataModule:
             max_duration=self.args.max_duration,
             shuffle=False,
         )
-        logging.debug("About to create test dataloader")
+        logging.info("About to create test dataloader")
         test_dl = DataLoader(
-            test,
+            test_dataset,
             batch_size=None,
             sampler=sampler,
             num_workers=self.args.num_workers,
@@ -390,21 +370,21 @@ class Xbmu_AmdoAsrDataModule:
 
     @lru_cache()
     def train_cuts(self) -> CutSet:
-        f = self.args.manifest_dir / "xbmu_amdo31_cuts_train.jsonl.gz"
-        logging.info(f"About to get train cuts from {f}")
-        cuts_train = load_manifest_lazy(f)
-        return cuts_train
+        logging.info("About to get train cuts")
+        return load_manifest_lazy(
+            self.args.manifest_dir / "xbmu_amdo31_cuts_train.jsonl.gz"
+        )
 
     @lru_cache()
-    def valid_cuts(self) -> CutSet:
-        f = self.args.manifest_dir / "xbmu_amdo31_cuts_dev.jsonl.gz"
-        logging.info(f"About to get valid cuts from {f}")
-        cuts_valid = load_manifest_lazy(f)
-        return cuts_valid
+    def dev_cuts(self) -> CutSet:
+        logging.info("About to get dev cuts")
+        return load_manifest_lazy(
+            self.args.manifest_dir / "xbmu_amdo31_cuts_dev.jsonl.gz"
+        )
 
     @lru_cache()
     def test_cuts(self) -> CutSet:
-        f = self.args.manifest_dir / "xbmu_amdo31_cuts_test.jsonl.gz"
-        logging.info(f"About to get test cuts from {f}")
-        cuts_test = load_manifest_lazy(f)
-        return cuts_test
+        logging.info("About to get test cuts")
+        return load_manifest_lazy(
+            self.args.manifest_dir / "xbmu_amdo31_cuts_test.jsonl.gz"
+        )
